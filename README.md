@@ -31,12 +31,24 @@ instead of classifying a window somebody else cut.
 
 ## Running
 
+Locally — simplest, and avoids the Colab issue below:
+
 ```bash
+git clone https://github.com/edumabagraham/understanding_mthars
+cd understanding_mthars
 pip install torch numpy matplotlib requests
 python test_mthars.py            # 33 tests, no dataset needed
 python compare.py --epochs 30    # downloads UCI-HAR, trains both, prints the table
 python compare.py --synthetic    # exercises the whole path without the download
 ```
+
+In Colab, the notebook needs the four `.py` files in its working directory.
+**This repository is private**, so `raw.githubusercontent.com` answers 404 to an
+unauthenticated Colab runtime and the automatic fetch fails. Either make the
+repository public, add a fine-grained PAT to Colab Secrets as `GITHUB_TOKEN`, or
+upload the files when the setup cell offers a file picker. The setup cell
+detects a saved 404 page and refuses to import it rather than failing later with
+a confusing `SyntaxError`.
 
 ## The comparison
 
