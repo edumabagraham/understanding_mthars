@@ -669,3 +669,46 @@ def weighted_f1(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) ->
         if precision + recall > 0:
             score += (support / total) * 2 * precision * recall / (precision + recall)
     return score
+
+
+def anchor_coverage(targets: Sequence[torch.Tensor], scales: Sequence[float],
+                    n: int, iou_threshold: float = 0.5) -> dict:
+    """How well the anchor set can represent the ground-truth activities.
+
+    The smallest anchor MTHARS generates is ``1/sqrt(max(scales))`` of the
+    stream, so an activity much shorter than that cannot be covered by any
+    window no matter how well the model trains. Duan's conclusion names this as
+    future work: "Future research could be conducted to improve the model's
+    performance on activity boundaries with very short durations."
+
+    Run this before reading any result on a new dataset. If ``matched_fraction``
+    is low, the scale set or the stream length is wrong for the data, and the
+    numbers say more about the anchors than about the model.
+
+    Returns mean/median best IoU per target, the fraction of targets whose best
+    IoU clears ``iou_threshold``, and the target length distribution.
+    """
+    windows = generate_windows(n, scales)
+
+    best_ious, lengths = [], []
+    for boxes in targets:
+        if boxes.numel() == 0:
+            continue
+        ious = iou_1d(windows, boxes)          # (A, T)
+        best_ious.append(ious.max(dim=0).values)
+        lengths.append(boxes[:, 1])
+
+    if not best_ious:
+        return {"targets": 0}
+
+    best_ious = torch.cat(best_ious)
+    lengths = torch.cat(lengths)
+    return {
+        "targets": int(best_ious.numel()),
+        "mean_best_iou": float(best_ious.mean()),
+        "median_best_iou": float(best_ious.median()),
+        "matched_fraction": float((best_ious >= iou_threshold).float().mean()),
+        "smallest_anchor": float(windows[:, 1].min()),
+        "median_target_length": float(lengths.median()),
+        "target_length_p10": float(lengths.quantile(0.10)),
+    }

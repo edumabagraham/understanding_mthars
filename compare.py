@@ -31,6 +31,7 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
 import har_data
+import mthars as mthars_module
 from har_data import (
     ACTIVITIES,
     StreamDataset,
@@ -139,8 +140,12 @@ def train_mthars(train_loader, num_classes: int, device, epochs: int = 30,
 
 @torch.no_grad()
 def evaluate_windows(model: SKNet, split, device, batch_size: int = 256) -> Dict:
-    """SKNet's own task: classify the shipped 128-timestep windows."""
+    """SKNet's own task: classify the pre-cut windows."""
     model.eval()
+    # Read the class count off the model rather than assuming a dataset:
+    # OPPORTUNITY has 18 classes, and weighting F1 over only the first 6 would
+    # quietly drop most of the data.
+    num_classes = model.classifier[-1].out_features
     predictions = []
     for start in range(0, len(split.labels), batch_size):
         x = split.windows[start:start + batch_size].to(device)
@@ -149,7 +154,7 @@ def evaluate_windows(model: SKNet, split, device, batch_size: int = 256) -> Dict
 
     return {
         "accuracy": float((predictions == split.labels).float().mean()),
-        "f1": weighted_f1(split.labels, predictions, len(ACTIVITIES)),
+        "f1": weighted_f1(split.labels, predictions, num_classes),
         "predictions": predictions,
     }
 
@@ -184,6 +189,7 @@ def evaluate_streams(sknet: SKNet, mthars: MTHARS, dataset: StreamDataset, devic
     """Score both models per timestep on the same streams."""
     sknet.eval()
     mthars.eval()
+    num_classes = mthars.num_classes
 
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
                         collate_fn=collate_streams)
@@ -223,7 +229,7 @@ def evaluate_streams(sknet: SKNet, mthars: MTHARS, dataset: StreamDataset, devic
                                     ("MTHARS", torch.cat(mt_all), mt_ned)):
         results[name] = {
             "accuracy": float((predictions == truth_all).float().mean()),
-            "f1": weighted_f1(truth_all, predictions, len(ACTIVITIES)),
+            "f1": weighted_f1(truth_all, predictions, num_classes),
             "ned": sum(neds) / len(neds),
         }
     return results
@@ -241,6 +247,8 @@ def main() -> None:
     parser.add_argument("--stream-batch-size", type=int, default=16)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--beta", type=float, default=1.0)
+    parser.add_argument("--dataset", choices=["uci", "wisdm", "opportunity"],
+                        default="uci")
     parser.add_argument("--data-dir", type=str, default="data")
     parser.add_argument("--synthetic", action="store_true",
                         help="run the whole pipeline on generated streams instead of "
@@ -253,17 +261,21 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
+    window = har_data.WINDOW
+    class_names = ACTIVITIES
+
     if args.synthetic:
-        print("\n*** SYNTHETIC MODE: generated signal, not UCI-HAR. "
+        print("\n*** SYNTHETIC MODE: generated signal, not a real dataset. "
               "These numbers are a code-path check, not a result. ***\n")
         train_recordings, test_recordings = har_data.normalize_recordings(
             har_data.synthetic_recordings(num_subjects=12, seed=0),
             har_data.synthetic_recordings(num_subjects=4, seed=1))
         # Windows are cut from the already-normalised recordings, so both views
-        # of the signal share statistics (as they do on the UCI path).
+        # of the signal share statistics.
         train_split = har_data.windows_from_recordings(train_recordings)
         test_split = har_data.windows_from_recordings(test_recordings)
-    else:
+
+    elif args.dataset == "uci":
         root = download_uci_har(args.data_dir)
         train_split, test_split = normalize(load_split(root, "train"),
                                             load_split(root, "test"))
@@ -274,6 +286,19 @@ def main() -> None:
         train_recordings = reconstruct_streams(train_split)
         test_recordings = reconstruct_streams(test_split)
 
+    else:
+        # WISDM and OPPORTUNITY ship genuine continuous recordings, so nothing
+        # has to be reconstructed: the activity boundaries are the real ones.
+        bundle = har_data.load_dataset(args.dataset, data_dir=args.data_dir)
+        train_recordings, test_recordings = bundle.train, bundle.test
+        window, class_names = bundle.window, bundle.class_names
+        if args.stream_length == parser.get_default("stream_length"):
+            args.stream_length = bundle.stream_length
+        train_split = har_data.windows_from_recordings(train_recordings, window=window,
+                                                       stride=window // 2)
+        test_split = har_data.windows_from_recordings(test_recordings, window=window,
+                                                      stride=window // 2)
+
     print(f"Train windows: {tuple(train_split.windows.shape)}  "
           f"Test windows: {tuple(test_split.windows.shape)}")
 
@@ -281,6 +306,16 @@ def main() -> None:
                                   stream_length=args.stream_length,
                                   stride=args.stream_length // 2)
     test_streams = StreamDataset(test_recordings, stream_length=args.stream_length)
+
+    # The smallest anchor is half the stream, so activities much shorter than
+    # that cannot be matched by any window. Say so before reporting anything.
+    coverage = mthars_module.anchor_coverage(
+        [test_streams[i][1] for i in range(len(test_streams))], (2.0, 3.0, 4.0),
+        mthars_module.feature_sequence_length(args.stream_length))
+    print(f"Anchor coverage: {coverage['matched_fraction']:.1%} of "
+          f"{coverage['targets']} activities reach IoU 0.5 "
+          f"(smallest anchor {coverage['smallest_anchor']:.2f} of the stream, "
+          f"median activity {coverage['median_target_length']:.2f})")
     print(f"Train streams: {len(train_streams)}  Test streams: {len(test_streams)}")
 
     train_loader = DataLoader(train_streams, batch_size=args.stream_batch_size,
@@ -289,13 +324,13 @@ def main() -> None:
 
     print("\nTraining SKNet...")
     start = time.time()
-    sknet = train_sknet(train_split, test_split, len(ACTIVITIES), device,
+    sknet = train_sknet(train_split, test_split, len(class_names), device,
                         epochs=args.epochs, batch_size=args.batch_size)
     sknet_time = time.time() - start
 
     print("\nTraining MTHARS...")
     start = time.time()
-    mthars = train_mthars(train_loader, len(ACTIVITIES), device,
+    mthars = train_mthars(train_loader, len(class_names), device,
                           epochs=args.epochs, alpha=args.alpha, beta=args.beta)
     mthars_time = time.time() - start
 
@@ -315,8 +350,9 @@ def main() -> None:
     delta_f1 = stream_results["MTHARS"]["f1"] - stream_results["SKNet"]["f1"]
     delta_acc = stream_results["MTHARS"]["accuracy"] - stream_results["SKNet"]["accuracy"]
     print(f"\nMTHARS - SKNet:  F1 {delta_f1:+.4f}   accuracy {delta_acc:+.4f}")
-    print("Duan Tables V/VI report, on UCI:  F1 +0.0165 (0.9558 -> 0.9723), "
-          "accuracy +0.0226 (0.9406 -> 0.9632)")
+    if args.dataset == "uci" and not args.synthetic:
+        print("Duan Tables V/VI report, on UCI:  F1 +0.0165 (0.9558 -> 0.9723), "
+              "accuracy +0.0226 (0.9406 -> 0.9632)")
 
     print(f"\nSKNet on the shipped 128-timestep windows (Gao's own task): "
           f"accuracy {window_results['accuracy']:.4f}, F1 {window_results['f1']:.4f}")

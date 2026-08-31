@@ -371,3 +371,303 @@ def normalize_recordings(train: Sequence[StreamRecording],
         scaled.append([StreamRecording((r.signal - mean) / std, r.intervals)
                        for r in group])
     return tuple(scaled)
+
+
+# --------------------------------------------------------------------------
+# Multiple datasets
+# --------------------------------------------------------------------------
+
+class DatasetBundle(NamedTuple):
+    """Everything a run needs, independent of which dataset it came from."""
+    name: str
+    train: List[StreamRecording]
+    test: List[StreamRecording]
+    class_names: List[str]
+    window: int          # window length for the sliding-window baseline
+    stream_length: int   # fixed stream length fed to MTHARS
+    rate: int            # sampling rate, Hz
+
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_names)
+
+    @property
+    def num_channels(self) -> int:
+        return self.train[0].signal.shape[1]
+
+
+def split_recordings(recordings: Sequence[StreamRecording], train_fraction: float = 0.7,
+                     seed: int = 42) -> Tuple[List[StreamRecording], List[StreamRecording]]:
+    """Random split over recordings.
+
+    Duan Sec. IV-E splits "70% and 30%" at random for every dataset except
+    PAMAP2. Splitting whole recordings rather than windows keeps a stream's
+    activity boundaries intact and stops the same seconds of signal appearing on
+    both sides, which a naive random split of windows would allow.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(len(recordings), generator=generator).tolist()
+    cut = max(1, int(round(train_fraction * len(recordings))))
+    return ([recordings[i] for i in order[:cut]],
+            [recordings[i] for i in order[cut:]])
+
+
+# ---------------------------------------------------------------- WISDM
+
+WISDM_URL = "https://www.cis.fordham.edu/wisdm/includes/datasets/latest/WISDM_ar_latest.tar.gz"
+
+WISDM_ACTIVITIES = ["Walking", "Jogging", "Upstairs", "Downstairs", "Sitting", "Standing"]
+
+
+def download_wisdm(data_dir: str = "data") -> Path:
+    """Download WISDM v1.1 and return the raw file.
+
+    Duan Table II lists WISDM with 29 subjects, 20 Hz and 1,098,208 samples,
+    which identifies v1.1 (`WISDM_ar_v1.1_raw.txt`).
+    """
+    import tarfile
+
+    import requests
+
+    data_dir = Path(data_dir)
+    raw = next(iter(data_dir.glob("**/WISDM_ar_v1.1_raw.txt")), None)
+    if raw is not None:
+        return raw
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive = data_dir / "wisdm.tar.gz"
+    response = requests.get(WISDM_URL, timeout=300)
+    response.raise_for_status()
+    archive.write_bytes(response.content)
+
+    with tarfile.open(archive) as tar:
+        tar.extractall(data_dir)
+
+    raw = next(iter(data_dir.glob("**/WISDM_ar_v1.1_raw.txt")), None)
+    if raw is None:
+        raise RuntimeError(f"WISDM_ar_v1.1_raw.txt not found under {data_dir}")
+    return raw
+
+
+def parse_wisdm(path: Path) -> List[StreamRecording]:
+    """Parse the WISDM raw file into one continuous recording per subject.
+
+    Format: comma-separated `user,activity,timestamp,x,y,z` records terminated
+    by `;`. The released file is famously untidy -- records run together on one
+    line, some are truncated, some have empty fields, some end `;;` -- so
+    anything that is not six well-formed fields is dropped and counted.
+
+    Unlike UCI-HAR this is genuine continuous signal, so the activity boundaries
+    are real rather than reconstructed.
+    """
+    text = Path(path).read_text(errors="replace")
+
+    activity_index = {name: i for i, name in enumerate(WISDM_ACTIVITIES)}
+    by_user: dict = {}
+    malformed = 0
+
+    for record in text.replace("\n", "").split(";"):
+        record = record.strip()
+        if not record:
+            continue
+        fields = record.split(",")
+        if len(fields) != 6 or fields[1] not in activity_index:
+            malformed += 1
+            continue
+        try:
+            user = int(fields[0])
+            timestamp = int(fields[2])
+            values = [float(v) for v in fields[3:6]]
+        except ValueError:
+            malformed += 1
+            continue
+        by_user.setdefault(user, []).append((timestamp, activity_index[fields[1]], values))
+
+    if not by_user:
+        raise RuntimeError(f"no usable records parsed from {path}")
+    print(f"WISDM: {sum(len(v) for v in by_user.values()):,} records from "
+          f"{len(by_user)} subjects ({malformed:,} malformed records dropped)")
+
+    recordings = []
+    for user in sorted(by_user):
+        rows = by_user[user]
+        signal = torch.tensor([values for _, _, values in rows], dtype=torch.float32)
+        labels = [label for _, label, _ in rows]
+
+        intervals, start = [], 0
+        for i in range(1, len(labels) + 1):
+            if i == len(labels) or labels[i] != labels[start]:
+                intervals.append((start, i, labels[start]))
+                start = i
+        recordings.append(StreamRecording(signal, intervals))
+    return recordings
+
+
+def load_wisdm(data_dir: str = "data", train_fraction: float = 0.7,
+               seed: int = 42, stream_length: int = 400) -> DatasetBundle:
+    """WISDM v1.1: 3 accelerometer channels, 20 Hz, 6 activities.
+
+    stream_length 400 = 20 s. Duan Table II lists a 10 s window for the static
+    sliding-window baseline, which is `window` below.
+    """
+    recordings = parse_wisdm(download_wisdm(data_dir))
+    train, test = split_recordings(recordings, train_fraction, seed)
+    train, test = normalize_recordings(train, test)
+    return DatasetBundle("WISDM", train, test, list(WISDM_ACTIVITIES),
+                         window=200, stream_length=stream_length, rate=20)
+
+
+# ---------------------------------------------------------------- OPPORTUNITY
+
+OPPORTUNITY_URL = ("https://archive.ics.uci.edu/static/public/226/"
+                   "opportunity+activity+recognition.zip")
+
+# The 113-channel selection used by essentially all OPPORTUNITY HAR work
+# (Ordonez & Roggen's DeepConvLSTM preprocessing): drop each IMU's four
+# quaternion columns, and everything from column 134 on (object and ambient
+# sensors). Indices are 0-based into the 250 columns of a .dat row.
+OPPORTUNITY_DROP = ([0]                                   # MILLISEC
+                    + list(range(46, 50)) + list(range(59, 63))
+                    + list(range(72, 76)) + list(range(85, 89))
+                    + list(range(98, 102)) + list(range(134, 250)))
+OPPORTUNITY_LABEL_COLUMN = 249       # ML_Both_Arms: 17 gestures + NULL
+OPPORTUNITY_CHANNELS = 113
+
+
+def download_opportunity(data_dir: str = "data") -> Path:
+    """Download OPPORTUNITY and return the directory holding the .dat files."""
+    import requests
+
+    data_dir = Path(data_dir)
+    dataset_dir = next(iter(data_dir.glob("**/OpportunityUCIDataset/dataset")), None)
+    if dataset_dir is not None:
+        return dataset_dir
+
+    data_dir.mkdir(parents=True, exist_ok=True)
+    archive = data_dir / "opportunity.zip"
+    response = requests.get(OPPORTUNITY_URL, timeout=600)
+    response.raise_for_status()
+    archive.write_bytes(response.content)
+
+    with zipfile.ZipFile(archive) as z:
+        z.extractall(data_dir)
+    for nested in data_dir.glob("*.zip"):
+        if nested != archive:
+            with zipfile.ZipFile(nested) as z:
+                z.extractall(data_dir)
+
+    dataset_dir = next(iter(data_dir.glob("**/OpportunityUCIDataset/dataset")), None)
+    if dataset_dir is None:
+        raise RuntimeError(f"OpportunityUCIDataset/dataset not found under {data_dir}")
+    return dataset_dir
+
+
+def parse_opportunity(dataset_dir: Path, files: Sequence[str] = None
+                      ) -> Tuple[List[StreamRecording], List[str]]:
+    """Parse OPPORTUNITY .dat runs into one recording per file.
+
+    Each row is 250 space-separated columns: a timestamp, 242 sensor readings,
+    and 7 label columns. Column 250 (`ML_Both_Arms`) carries the 17 kitchen
+    gestures plus NULL, which is the 18 categories Duan Table II lists.
+
+    Missing sensor values are linearly interpolated, as Duan Sec. IV-A states
+    ("Interpolation was performed to fill in missing values in the dataset").
+    Label codes are discovered from the data rather than hardcoded, so a
+    mismatch shows up in the returned class names instead of silently
+    mislabelling.
+    """
+    dataset_dir = Path(dataset_dir)
+    files = files or sorted(p.name for p in dataset_dir.glob("S*-*.dat"))
+    if not files:
+        raise RuntimeError(f"no .dat files in {dataset_dir}")
+
+    keep = [c for c in range(250) if c not in set(OPPORTUNITY_DROP)]
+    if len(keep) != OPPORTUNITY_CHANNELS:
+        raise RuntimeError(f"channel selection yields {len(keep)}, expected "
+                           f"{OPPORTUNITY_CHANNELS}; OPPORTUNITY_DROP is wrong")
+
+    raw_runs, codes = [], set()
+    for name in files:
+        table = np.loadtxt(dataset_dir / name)
+        if table.shape[1] != 250:
+            raise RuntimeError(f"{name}: {table.shape[1]} columns, expected 250")
+        signal = table[:, keep]
+        labels = table[:, OPPORTUNITY_LABEL_COLUMN].astype(np.int64)
+        codes.update(np.unique(labels).tolist())
+        raw_runs.append((name, signal, labels))
+
+    # 0 is NULL and stays class 0; the rest keep their numeric order.
+    ordered = [0] + sorted(c for c in codes if c != 0)
+    code_to_index = {code: i for i, code in enumerate(ordered)}
+    class_names = ["NULL"] + [f"gesture_{c}" for c in ordered[1:]]
+    if len(class_names) != 18:
+        print(f"warning: found {len(class_names)} label codes, Duan Table II "
+              f"lists 18 activity categories for OPPORTUNITY")
+
+    recordings = []
+    for name, signal, labels in raw_runs:
+        signal = _interpolate_nans(signal)
+        mapped = [code_to_index[int(c)] for c in labels]
+
+        intervals, start = [], 0
+        for i in range(1, len(mapped) + 1):
+            if i == len(mapped) or mapped[i] != mapped[start]:
+                intervals.append((start, i, mapped[start]))
+                start = i
+        recordings.append(StreamRecording(torch.from_numpy(signal).float(), intervals))
+
+    print(f"OPPORTUNITY: {len(recordings)} runs, "
+          f"{sum(len(r.signal) for r in recordings):,} samples, "
+          f"{len(class_names)} classes")
+    return recordings, class_names
+
+
+def _interpolate_nans(signal: "np.ndarray") -> "np.ndarray":
+    """Linear interpolation over NaNs, per channel; leading/trailing NaNs -> 0."""
+    signal = signal.copy()
+    for c in range(signal.shape[1]):
+        column = signal[:, c]
+        missing = np.isnan(column)
+        if not missing.any():
+            continue
+        if missing.all():
+            signal[:, c] = 0.0
+            continue
+        index = np.arange(len(column))
+        column[missing] = np.interp(index[missing], index[~missing], column[~missing])
+        signal[:, c] = column
+    return signal
+
+
+def load_opportunity(data_dir: str = "data", train_fraction: float = 0.7,
+                     seed: int = 42, stream_length: int = 256) -> DatasetBundle:
+    """OPPORTUNITY: 113 IMU channels, 30 Hz, 17 gestures + NULL.
+
+    stream_length 256 = 8.5 s. The gestures here are short, so check
+    `anchor_coverage` before trusting any result: the smallest anchor is half
+    the stream, and an activity much shorter than that cannot be matched.
+    """
+    recordings, class_names = parse_opportunity(download_opportunity(data_dir))
+    train, test = split_recordings(recordings, train_fraction, seed)
+    train, test = normalize_recordings(train, test)
+    return DatasetBundle("OPPORTUNITY", train, test, class_names,
+                         window=30, stream_length=stream_length, rate=30)
+
+
+# ---------------------------------------------------------------- UCI bundle
+
+def load_uci(data_dir: str = "data", stream_length: int = 1024) -> DatasetBundle:
+    """UCI-HAR as a bundle, using the official subject-disjoint split."""
+    root = download_uci_har(data_dir)
+    train_split, test_split = normalize(load_split(root, "train"),
+                                        load_split(root, "test"))
+    return DatasetBundle("UCI", reconstruct_streams(train_split),
+                         reconstruct_streams(test_split), list(ACTIVITIES),
+                         window=WINDOW, stream_length=stream_length, rate=50)
+
+
+def load_dataset(name: str, data_dir: str = "data", **kwargs) -> DatasetBundle:
+    loaders = {"uci": load_uci, "wisdm": load_wisdm, "opportunity": load_opportunity}
+    if name not in loaders:
+        raise ValueError(f"unknown dataset {name!r}; choose from {sorted(loaders)}")
+    return loaders[name](data_dir=data_dir, **kwargs)
